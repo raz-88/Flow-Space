@@ -1,0 +1,352 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper: Verify user is authenticated
+    function isAuthenticated() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    // Helper: Verify user owns the document by UID
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Helper: Safely check workspace document existence
+    function workspaceExists(workspaceId) {
+      return exists(/databases/$(database)/documents/workspaces/$(workspaceId));
+    }
+
+    // Helper: Get workspace data
+    function getWorkspace(workspaceId) {
+      return get(/databases/$(database)/documents/workspaces/$(workspaceId)).data;
+    }
+
+    // Helper: Check if request user is in workspace memberIds
+    function isWorkspaceMember(workspaceId) {
+      return isAuthenticated() &&
+             workspaceExists(workspaceId) &&
+             (request.auth.uid in getWorkspace(workspaceId).memberIds);
+    }
+
+    // Helper: Check if request user is workspace owner
+    function isWorkspaceOwner(workspaceId) {
+      return isAuthenticated() &&
+             workspaceExists(workspaceId) &&
+             (request.auth.uid == getWorkspace(workspaceId).ownerId);
+    }
+
+    // Helper: Check if request user is an admin or owner of the workspace
+    function isWorkspaceAdminOrOwner(workspaceId) {
+      return isAuthenticated() &&
+             workspaceExists(workspaceId) &&
+             (
+               request.auth.uid == getWorkspace(workspaceId).ownerId ||
+               (
+                 exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)) &&
+                 get(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role in ['admin', 'owner']
+               )
+             );
+    }
+
+    // Helper: Invitation path
+    function invitePath(workspaceId, userUid) {
+      return /databases/$(database)/documents/invitations/$(workspaceId + "_" + userUid);
+    }
+
+    // Helper: Check if user has a verified pending invitation
+    function hasPendingInvitation(workspaceId, userUid) {
+      return exists(invitePath(workspaceId, userUid)) &&
+             get(invitePath(workspaceId, userUid)).data.status == 'pending' &&
+             get(invitePath(workspaceId, userUid)).data.recipientEmail == request.auth.token.email;
+    }
+
+    // Helper: Safely verify active link or join code invitation
+    function hasValidActiveInvite(workspaceId, inviteId) {
+      return exists(/databases/$(database)/documents/invitations/$(inviteId)) &&
+             get(/databases/$(database)/documents/invitations/$(inviteId)).data.workspaceId == workspaceId &&
+             get(/databases/$(database)/documents/invitations/$(inviteId)).data.status == 'active' &&
+             (
+               !('expiresAt' in get(/databases/$(database)/documents/invitations/$(inviteId)).data) ||
+               get(/databases/$(database)/documents/invitations/$(inviteId)).data.expiresAt > request.time
+             ) &&
+             (
+               !('maxUses' in get(/databases/$(database)/documents/invitations/$(inviteId)).data) ||
+               get(/databases/$(database)/documents/invitations/$(inviteId)).data.maxUses == null ||
+               get(/databases/$(database)/documents/invitations/$(inviteId)).data.usedCount < get(/databases/$(database)/documents/invitations/$(inviteId)).data.maxUses
+             );
+    }
+
+    // ----------------------------------------------------
+    // USER PROFILES
+    // ----------------------------------------------------
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+
+      allow create: if isOwner(userId)
+                    && request.resource.data.uid == userId
+                    && request.resource.data.email == request.auth.token.email
+                    && (!request.resource.data.keys().hasAny(['role', 'isAdmin', 'superAdmin', 'permissions']));
+
+      allow update: if isOwner(userId)
+                    && request.resource.data.uid == resource.data.uid
+                    && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'isAdmin', 'superAdmin', 'permissions', 'uid', 'createdAt']));
+
+      allow delete: if false;
+
+      // Personal Tasks (Strictly private to the user)
+      match /tasks/{taskId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // In-App Notification Center (Private to recipient)
+      match /notifications/{notificationId} {
+        allow read: if isOwner(userId);
+
+        // Allowed to be created by authenticated workspace peers or self
+        allow create: if isAuthenticated()
+                      && request.resource.data.userId == userId;
+
+        // User can only mark read/unread; cannot alter core notification metadata
+        allow update: if isOwner(userId)
+                      && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['userId', 'createdAt', 'type', 'relatedWorkspaceId', 'relatedTaskId']));
+
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    // ----------------------------------------------------
+    // WORKSPACES
+    // ----------------------------------------------------
+    match /workspaces/{workspaceId} {
+      // Only members can view the workspace
+      allow read: if isAuthenticated() && (request.auth.uid in resource.data.memberIds);
+
+      // Authenticated user creates workspace, setting themselves as owner
+      allow create: if isAuthenticated()
+                    && request.resource.data.ownerId == request.auth.uid
+                    && request.resource.data.memberIds == [request.auth.uid]
+                    && request.resource.data.memberCount == 1;
+
+      // Updates strictly controlled:
+      // 1. Admin/Owner updating settings or removing members
+      // 2. Member leaving: removing only their own UID from memberIds
+      // 3. User joining: adding only their own UID with verified pending invitation
+      allow update: if isAuthenticated() && (
+        (
+          isWorkspaceAdminOrOwner(workspaceId) &&
+          (request.resource.data.ownerId == resource.data.ownerId || isWorkspaceOwner(workspaceId))
+        ) ||
+        (
+          request.auth.uid in resource.data.memberIds &&
+          !(request.auth.uid in request.resource.data.memberIds) &&
+          request.resource.data.ownerId == resource.data.ownerId
+        ) ||
+        (
+          !(request.auth.uid in resource.data.memberIds) &&
+          (request.auth.uid in request.resource.data.memberIds) &&
+          request.resource.data.ownerId == resource.data.ownerId &&
+          (
+            hasPendingInvitation(workspaceId, request.auth.uid) ||
+            (
+              existsAfter(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)) &&
+              getAfter(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.auth.uid)).data.role == 'member'
+            )
+          )
+        )
+      );
+
+      // Only the workspace owner can delete the workspace
+      allow delete: if isAuthenticated() && (request.auth.uid == resource.data.ownerId);
+
+      // --------------------------------------------------
+      // WORKSPACE MEMBERS
+      // --------------------------------------------------
+      match /members/{memberId} {
+        // Only members of the workspace can view the member directory
+        allow read: if isWorkspaceMember(workspaceId);
+
+        // Member creation:
+        // 1. Owner creating their initial member record
+        // 2. Admin/Owner adding a member
+        // 3. User joining via verified pending email invitation matching role
+        // 4. User joining via active link/code invitation as role 'member'
+        allow create: if isAuthenticated() && (
+          (
+            request.auth.uid == memberId &&
+            request.resource.data.role == 'owner' &&
+            request.auth.uid == getWorkspace(workspaceId).ownerId
+          ) ||
+          (
+            isWorkspaceAdminOrOwner(workspaceId) &&
+            request.resource.data.role in ['admin', 'member']
+          ) ||
+          (
+            request.auth.uid == memberId &&
+            hasPendingInvitation(workspaceId, request.auth.uid) &&
+            request.resource.data.role == get(invitePath(workspaceId, request.auth.uid)).data.role
+          ) ||
+          (
+            request.auth.uid == memberId &&
+            request.resource.data.role == 'member' &&
+            'inviteId' in request.resource.data &&
+            hasValidActiveInvite(workspaceId, request.resource.data.inviteId)
+          )
+        );
+
+        // Role updates:
+        // - Admin or Owner only
+        // - Cannot alter uid
+        // - Cannot alter owner's role unless request user is the owner
+        // - Only owner can assign 'owner' role
+        // - Non-owners cannot alter their own role (prevents self-promotion)
+        allow update: if isAuthenticated() && (
+          isWorkspaceAdminOrOwner(workspaceId) &&
+          request.resource.data.uid == resource.data.uid &&
+          (resource.data.role != 'owner' || isWorkspaceOwner(workspaceId)) &&
+          (request.resource.data.role != 'owner' || isWorkspaceOwner(workspaceId)) &&
+          (request.auth.uid != memberId || isWorkspaceOwner(workspaceId))
+        );
+
+        // Member removal:
+        // - Non-owner self-leave
+        // - Owner or Admin removing a member (cannot remove the owner!)
+        allow delete: if isAuthenticated() && (
+          (
+            request.auth.uid == memberId &&
+            resource.data.role != 'owner'
+          ) ||
+          (
+            isWorkspaceAdminOrOwner(workspaceId) &&
+            resource.data.role != 'owner' &&
+            (isWorkspaceOwner(workspaceId) || resource.data.role == 'member')
+          )
+        );
+      }
+
+      // --------------------------------------------------
+      // WORKSPACE SHARED TASKS
+      // --------------------------------------------------
+      match /tasks/{taskId} {
+        allow read: if isWorkspaceMember(workspaceId);
+
+        allow create: if isWorkspaceMember(workspaceId)
+                      && request.resource.data.workspaceId == workspaceId
+                      && request.resource.data.createdByUid == request.auth.uid;
+
+        allow update: if isWorkspaceMember(workspaceId)
+                      && request.resource.data.workspaceId == resource.data.workspaceId
+                      && request.resource.data.createdByUid == resource.data.createdByUid;
+
+        allow delete: if isWorkspaceAdminOrOwner(workspaceId) || (
+          isWorkspaceMember(workspaceId) && resource.data.createdByUid == request.auth.uid
+        );
+
+        // ------------------------------------------------
+        // TASK COMMENTS & DISCUSSION (Module 4)
+        // ------------------------------------------------
+        match /comments/{commentId} {
+          allow read: if isWorkspaceMember(workspaceId);
+
+          allow create: if isWorkspaceMember(workspaceId)
+                        && request.resource.data.workspaceId == workspaceId
+                        && request.resource.data.taskId == taskId
+                        && request.resource.data.authorUid == request.auth.uid;
+
+          allow update: if isWorkspaceMember(workspaceId)
+                        && resource.data.authorUid == request.auth.uid
+                        && request.resource.data.authorUid == request.auth.uid
+                        && request.resource.data.workspaceId == workspaceId
+                        && request.resource.data.taskId == taskId;
+
+          allow delete: if isWorkspaceMember(workspaceId) && (
+            resource.data.authorUid == request.auth.uid ||
+            isWorkspaceAdminOrOwner(workspaceId)
+          );
+        }
+      }
+
+      // --------------------------------------------------
+      // WORKSPACE ACTIVITY HISTORY (Immutable audit log)
+      // --------------------------------------------------
+      match /activity/{activityId} {
+        allow read: if isWorkspaceMember(workspaceId);
+
+        // Actor ID must match request.auth.uid to prevent forging events
+        allow create: if isWorkspaceMember(workspaceId)
+                      && request.resource.data.workspaceId == workspaceId
+                      && request.resource.data.actorId == request.auth.uid;
+
+        allow update, delete: if false;
+      }
+    }
+
+    // ----------------------------------------------------
+    // INVITATIONS
+    // ----------------------------------------------------
+    match /invitations/{invitationId} {
+      allow read: if isAuthenticated() && (
+        (resource.data.keys().hasAll(['recipientEmail']) && resource.data.recipientEmail == request.auth.token.email) ||
+        (resource.data.keys().hasAll(['recipientUid']) && resource.data.recipientUid == request.auth.uid) ||
+        request.auth.uid == resource.data.inviterUid ||
+        isWorkspaceMember(resource.data.workspaceId) ||
+        (resource.data.status == 'active' && resource.data.type in ['link', 'code'])
+      );
+
+      // Only workspace Admins or Owners can create invitations
+      allow create: if isAuthenticated()
+                    && isWorkspaceAdminOrOwner(request.resource.data.workspaceId)
+                    && request.resource.data.inviterUid == request.auth.uid
+                    && (request.resource.data.status in ['pending', 'active'])
+                    && request.resource.data.role in ['admin', 'member'];
+
+      // Updates:
+      // - Recipient accepting/declining email invitation
+      // - Workspace Admin/Owner revoking or expiring
+      // - Joining user consuming link/code invitation
+      allow update: if isAuthenticated() && (
+        (
+          (
+            (resource.data.keys().hasAll(['recipientEmail']) && resource.data.recipientEmail == request.auth.token.email) ||
+            (resource.data.keys().hasAll(['recipientUid']) && resource.data.recipientUid == request.auth.uid)
+          ) &&
+          request.resource.data.status in ['accepted', 'declined'] &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['workspaceId', 'recipientEmail', 'role', 'inviterUid'])
+        ) ||
+        (
+          isWorkspaceAdminOrOwner(resource.data.workspaceId) &&
+          request.resource.data.status in ['revoked', 'expired']
+        ) ||
+        (
+          resource.data.status == 'active' &&
+          resource.data.type in ['link', 'code'] &&
+          request.resource.data.workspaceId == resource.data.workspaceId &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.inviterUid == resource.data.inviterUid &&
+          request.resource.data.usedCount == resource.data.usedCount + 1 &&
+          !(request.auth.uid in resource.data.usedBy) &&
+          (request.auth.uid in request.resource.data.usedBy) &&
+          (request.resource.data.status in ['active', 'expired'])
+        )
+      );
+
+      allow delete: if false;
+    }
+
+    // ----------------------------------------------------
+    // SERVER-SIDE EMAIL QUEUE (Module 3)
+    // ----------------------------------------------------
+    match /mail/{mailId} {
+      // Authenticated users can enqueue email events with status 'pending'
+      allow create: if isAuthenticated();
+
+      // Clients cannot read or mutate queued messages (only server-side worker has access)
+      allow read, update, delete: if false;
+    }
+
+    // Default deny all other paths
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
