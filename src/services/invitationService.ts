@@ -12,7 +12,6 @@ import {
   increment,
   Timestamp,
   runTransaction,
-  orderBy,
   type Unsubscribe,
 } from 'firebase/firestore';
 import { db } from '../firebase/config';
@@ -86,10 +85,16 @@ export async function sendWorkspaceInvitation(
   // 4. Check for active pending invitation using deterministic ID
   const inviteId = `${workspace.id}_${targetUser.uid}`;
   const inviteDocRef = doc(db, 'invitations', inviteId);
-  const existingSnap = await getDoc(inviteDocRef);
-
-  if (existingSnap.exists() && existingSnap.data()?.status === 'pending') {
-    throw new Error(`A pending invitation has already been sent to ${cleanEmail}.`);
+  try {
+    const existingSnap = await getDoc(inviteDocRef);
+    if (existingSnap.exists() && existingSnap.data()?.status === 'pending') {
+      throw new Error(`A pending invitation has already been sent to ${cleanEmail}.`);
+    }
+  } catch (err: unknown) {
+    if (err instanceof Error && err.message.includes('pending invitation has already been sent')) {
+      throw err;
+    }
+    // Non-fatal if document does not exist yet or read is unauthorized
   }
 
   await setDoc(inviteDocRef, {
@@ -612,10 +617,10 @@ export function subscribeToAllWorkspaceInvitations(
   onError?: (error: Error) => void
 ): Unsubscribe {
   const invitationsRef = collection(db, 'invitations');
+  // Avoid multi-field composite index by filtering on workspaceId and sorting client-side
   const q = query(
     invitationsRef,
-    where('workspaceId', '==', workspaceId),
-    orderBy('createdAt', 'desc')
+    where('workspaceId', '==', workspaceId)
   );
 
   return onSnapshot(
@@ -644,6 +649,18 @@ export function subscribeToAllWorkspaceInvitations(
           usedBy: data.usedBy || [],
         } as WorkspaceInvitation;
       });
+
+      // Sort descending by createdAt in memory
+      list.sort((a, b) => {
+        const timeA =
+          (a.createdAt as Timestamp)?.toMillis?.() ||
+          (a.createdAt ? new Date(a.createdAt as unknown as string).getTime() : 0);
+        const timeB =
+          (b.createdAt as Timestamp)?.toMillis?.() ||
+          (b.createdAt ? new Date(b.createdAt as unknown as string).getTime() : 0);
+        return timeB - timeA;
+      });
+
       onInvitationsUpdated(list);
     },
     (err) => {

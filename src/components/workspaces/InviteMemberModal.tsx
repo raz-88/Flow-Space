@@ -88,10 +88,10 @@ export const InviteMemberModal: React.FC<InviteMemberModalProps> = ({
     if (!workspace?.id) return;
     try {
       setLoadingActiveInvites(true);
+      // Query by workspaceId only to prevent composite index requirements
       const q = query(
         collection(db, 'invitations'),
-        where('workspaceId', '==', workspace.id),
-        where('status', '==', 'active')
+        where('workspaceId', '==', workspace.id)
       );
       const snap = await getDocs(q);
       let foundLink: WorkspaceInvitation | null = null;
@@ -99,6 +99,7 @@ export const InviteMemberModal: React.FC<InviteMemberModalProps> = ({
 
       snap.forEach((d) => {
         const data = d.data();
+        if (data.status !== 'active') return;
         const inv = { id: d.id, ...data } as WorkspaceInvitation;
         if (inv.type === 'link' || d.id.startsWith('link_')) {
           if (!foundLink) foundLink = inv;

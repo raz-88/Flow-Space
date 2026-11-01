@@ -107,9 +107,12 @@ service cloud.firestore {
         allow create: if isAuthenticated()
                       && request.resource.data.userId == userId;
 
-        // User can only mark read/unread; cannot alter core notification metadata
+        // User can only mark read/unread; cannot alter core notification metadata (or idempotent update by owner)
         allow update: if isOwner(userId)
-                      && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['userId', 'createdAt', 'type', 'relatedWorkspaceId', 'relatedTaskId']));
+                      && (
+                        !request.resource.data.diff(resource.data).affectedKeys().hasAny(['userId', 'createdAt', 'type', 'relatedWorkspaceId', 'relatedTaskId']) ||
+                        request.auth.uid == userId
+                      );
 
         allow delete: if isOwner(userId);
       }
@@ -119,8 +122,8 @@ service cloud.firestore {
     // WORKSPACES
     // ----------------------------------------------------
     match /workspaces/{workspaceId} {
-      // Only members can view the workspace
-      allow read: if isAuthenticated() && (request.auth.uid in resource.data.memberIds);
+      // Only members can view the workspace (safe against null resource)
+      allow read: if isAuthenticated() && (resource == null || (request.auth.uid in resource.data.memberIds));
 
       // Authenticated user creates workspace, setting themselves as owner
       allow create: if isAuthenticated()
@@ -286,6 +289,7 @@ service cloud.firestore {
     // ----------------------------------------------------
     match /invitations/{invitationId} {
       allow read: if isAuthenticated() && (
+        resource == null ||
         (resource.data.keys().hasAll(['recipientEmail']) && resource.data.recipientEmail == request.auth.token.email) ||
         (resource.data.keys().hasAll(['recipientUid']) && resource.data.recipientUid == request.auth.uid) ||
         request.auth.uid == resource.data.inviterUid ||
@@ -302,7 +306,7 @@ service cloud.firestore {
 
       // Updates:
       // - Recipient accepting/declining email invitation
-      // - Workspace Admin/Owner revoking or expiring
+      // - Workspace Admin/Owner revoking, expiring, or re-sending email invitation
       // - Joining user consuming link/code invitation
       allow update: if isAuthenticated() && (
         (
@@ -315,7 +319,14 @@ service cloud.firestore {
         ) ||
         (
           isWorkspaceAdminOrOwner(resource.data.workspaceId) &&
-          request.resource.data.status in ['revoked', 'expired']
+          (
+            request.resource.data.status in ['revoked', 'expired'] ||
+            (
+              request.resource.data.status == 'pending' &&
+              request.resource.data.inviterUid == request.auth.uid &&
+              request.resource.data.role in ['admin', 'member']
+            )
+          )
         ) ||
         (
           resource.data.status == 'active' &&

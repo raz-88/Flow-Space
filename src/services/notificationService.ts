@@ -2,6 +2,7 @@ import {
   collection,
   doc,
   setDoc,
+  getDoc,
   updateDoc,
   deleteDoc,
   onSnapshot,
@@ -82,6 +83,19 @@ export async function createNotification(
     const docRef = notification.deterministicKey
       ? doc(notifsRef, notification.deterministicKey)
       : doc(notifsRef);
+
+    // If deterministic key is provided, check if already dispatched to avoid duplicate writes and permission conflicts
+    if (notification.deterministicKey) {
+      try {
+        const snap = await getDoc(docRef);
+        if (snap.exists()) {
+          // Already dispatched; do not overwrite or flip read status
+          return;
+        }
+      } catch {
+        // Continue if getDoc fails
+      }
+    }
 
     await setDoc(
       docRef,
